@@ -1,4 +1,11 @@
-"""Interactive RAG system with dense embeddings and FAISS-backed retrieval."""
+"""
+Advanced RAG System with:
+- Hybrid search (dense + BM25)
+- Query enhancement
+- Conversation memory
+- Citations and confidence scoring
+- Streaming responses
+"""
 
 from argparse import ArgumentParser
 from pathlib import Path
@@ -8,14 +15,14 @@ import sys
 
 from chunking.semantic import recursive_chunk
 from core.chunk import Chunk
-from core.context import build_context
 from core.document import Document
 from core.index import VectorIndex
-from core.retriever import Retriever
-from generation.generator import generate_response
-from generation.llm import is_llm_available, query_llm
+from core.memory import ConversationMemory
+from generation.answer import AnswerGenerator, AnswerResult
 from ingestion.loaders import load_documents_from_directory, load_documents_from_paths
+from retrieval.hybrid import HybridRetriever
 from retrieval.mmr import rerank_mmr
+from retrieval.query import QueryEnhancer
 
 # Configure logging
 logging.basicConfig(
@@ -26,6 +33,12 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 EXIT_COMMANDS = {"quit", "exit", "q", "bye", "stop"}
+SPECIAL_COMMANDS = {
+    "/clear": "Clear conversation history",
+    "/sources": "Show sources from last answer",
+    "/debug": "Toggle debug mode",
+    "/help": "Show available commands",
+}
 
 
 def chunk_document(
@@ -46,8 +59,8 @@ def chunk_document(
     for idx, (chunk_text, start_pos) in enumerate(chunk_tuples):
         chunks.append(
             Chunk(
-                id=f"{doc.id}-{idx}",
-                text=chunk_text,
+            id=f"{doc.id}-{idx}",
+            text=chunk_text,
                 metadata={
                     "doc_id": doc.id,
                     "chunk_idx": str(idx),
@@ -126,81 +139,173 @@ def build_index(
     return index
 
 
-def answer_query(
-    index: VectorIndex,
-    retriever: Retriever,
-    query: str,
-    use_llm: bool,
-    show_steps: bool,
-    top_k: int = 5,
-    rerank_k: int = 3,
-) -> str:
-    """Retrieve relevant chunks and generate an answer."""
-    if not index.entries:
-        return "No documents have been indexed."
+class RAGSystem:
+    """
+    Complete RAG system with all features.
+    """
 
-    # Retrieve candidates
-    candidates = retriever.retrieve(query, top_k=top_k)
+    def __init__(
+        self,
+        index: VectorIndex,
+        use_llm: bool = True,
+        use_query_enhancement: bool = True,
+        show_steps: bool = False,
+    ):
+        self.index = index
+        self.use_llm = use_llm
+        self.show_steps = show_steps
 
-    if show_steps:
-        LOGGER.info("Retrieved %d candidates:", len(candidates))
-        for i, (entry, score) in enumerate(candidates):
-            LOGGER.info(
-                "  [%d] score=%.4f | %s | %s...",
-                i + 1,
-                score,
-                entry.chunk.id,
-                entry.chunk.text[:60].replace("\n", " "),
-            )
+        # Initialize components
+        self.retriever = HybridRetriever(index, alpha=0.6)  # Favor dense
+        self.retriever.fit()
 
-    if not candidates:
-        return "No relevant information found for your query."
+        self.query_enhancer = QueryEnhancer(use_llm=use_query_enhancement)
+        self.answer_generator = AnswerGenerator()
+        self.memory = ConversationMemory(max_messages=10)
 
-    # Rerank with MMR for diversity
-    query_embedding = index.embed_query(query)
-    mmr_entries = rerank_mmr(query_embedding, candidates, top_k=rerank_k)
+        self.debug_mode = False
+        self.last_result: Optional[AnswerResult] = None
 
-    if show_steps:
-        LOGGER.info("After MMR reranking: %d chunks", len(mmr_entries))
+    def answer(self, query: str, stream: bool = False) -> str:
+        """
+        Answer a query using the RAG pipeline.
+        
+        Pipeline:
+        1. Query enhancement (optional)
+        2. Hybrid retrieval (dense + BM25)
+        3. MMR reranking
+        4. Answer generation with citations
+        5. Memory update
+        """
+        # Get conversation context
+        conv_context = self.memory.get_context_string(max_chars=1000)
 
-    # Build context from selected chunks
-    context_chunks = [entry.chunk for entry in mmr_entries]
-    context = build_context(context_chunks)
-
-    # Generate answer
-    if use_llm:
-        if is_llm_available():
+        # Query enhancement
+        enhanced_query = query
+        if self.use_llm and not query.startswith("/"):
             try:
-                answer = query_llm(context, query)
-                if show_steps:
-                    LOGGER.info("Generated answer using OpenAI LLM")
-                return answer
+                enhanced_query = self.query_enhancer.rewrite_query(query, conv_context)
+                if self.debug_mode and enhanced_query != query:
+                    LOGGER.info("Enhanced query: %s", enhanced_query)
             except Exception as e:
-                LOGGER.warning("LLM error: %s; using local generator", e)
-                return generate_response(context, query)
+                LOGGER.debug("Query enhancement failed: %s", e)
+
+        # Hybrid retrieval
+        results = self.retriever.search(enhanced_query, top_k=10)
+
+        if self.show_steps or self.debug_mode:
+            LOGGER.info("Retrieved %d candidates", len(results))
+            for i, (entry, score) in enumerate(results[:3]):
+                LOGGER.info(
+                    "  [%d] %.3f | %s",
+                    i + 1,
+                    score,
+                    entry.chunk.text[:60].replace("\n", " "),
+                )
+
+        # MMR reranking for diversity
+        query_embedding = self.index.embed_query(enhanced_query)
+        reranked = rerank_mmr(query_embedding, results, top_k=5, lambda_param=0.7)
+
+        # Prepare chunks with scores
+        chunks_with_scores = []
+        score_map = {id(entry): score for entry, score in results}
+        for entry in reranked:
+            score = score_map.get(id(entry), 0.5)
+            chunks_with_scores.append((entry.chunk, score))
+
+        # Generate answer
+        if stream:
+            answer_parts = []
+            for part in self.answer_generator.generate_streaming(query, chunks_with_scores):
+                answer_parts.append(part)
+                print(part, end="", flush=True)
+            print()  # Newline after streaming
+            answer = "".join(answer_parts)
+            self.last_result = AnswerResult(
+                answer=answer,
+                confidence=self.answer_generator._calculate_confidence(chunks_with_scores),
+                sources_used=len(chunks_with_scores),
+            )
         else:
-            if show_steps:
-                LOGGER.warning("LLM not available; using local generator")
-            return generate_response(context, query)
-    else:
-        return generate_response(context, query)
+            self.last_result = self.answer_generator.generate(
+                query,
+                chunks_with_scores,
+                conv_context,
+            )
+            answer = self.last_result.answer
+
+        # Update memory
+        self.memory.add_user_message(query)
+        sources = [c.metadata.get("doc_id", "") for c, _ in chunks_with_scores]
+        self.memory.add_assistant_message(
+            answer,
+            sources=sources,
+            confidence=self.last_result.confidence,
+        )
+
+        return answer
+
+    def handle_command(self, command: str) -> Optional[str]:
+        """Handle special commands."""
+        cmd = command.lower().strip()
+
+        if cmd == "/clear":
+            self.memory.clear()
+            return "✓ Conversation cleared"
+
+        elif cmd == "/sources":
+            if not self.last_result or not self.last_result.citations:
+                return "No sources from last answer"
+            
+            lines = ["📚 Sources:"]
+            for i, cite in enumerate(self.last_result.citations, 1):
+                lines.append(f"  [{i}] {cite.doc_id}")
+                lines.append(f"      Score: {cite.relevance_score:.3f}")
+                lines.append(f"      Snippet: {cite.text_snippet[:80]}...")
+            return "\n".join(lines)
+
+        elif cmd == "/debug":
+            self.debug_mode = not self.debug_mode
+            return f"✓ Debug mode: {'ON' if self.debug_mode else 'OFF'}"
+
+        elif cmd == "/help":
+            lines = ["📖 Commands:"]
+            for cmd, desc in SPECIAL_COMMANDS.items():
+                lines.append(f"  {cmd}: {desc}")
+            lines.append(f"  {', '.join(EXIT_COMMANDS)}: Exit")
+            return "\n".join(lines)
+
+        return None
+
+    def format_response(self, answer: str) -> str:
+        """Format the response with confidence indicator."""
+        if not self.last_result:
+            return answer
+
+        conf = self.last_result.confidence
+        if conf >= 0.7:
+            indicator = "🟢"  # High confidence
+        elif conf >= 0.4:
+            indicator = "🟡"  # Medium confidence
+        else:
+            indicator = "🔴"  # Low confidence
+
+        if self.debug_mode:
+            return f"{answer}\n\n{indicator} Confidence: {conf:.0%} | Sources: {self.last_result.sources_used}"
+        return answer
 
 
-def interactive_loop(
-    index: VectorIndex,
-    retriever: Retriever,
-    use_llm: bool,
-    show_steps: bool,
-) -> None:
+def interactive_loop(rag: RAGSystem, stream: bool = False) -> None:
     """Run an interactive Q&A session."""
     print("\n" + "=" * 60)
-    print("🔍 RAG System Ready!")
-    print(f"   {len(index.entries)} chunks indexed")
-    print(f"   Embedding dimension: {index.embedding_model.dimension}")
-    print(f"   LLM mode: {'OpenAI' if use_llm and is_llm_available() else 'Local'}")
+    print("🔍 Advanced RAG System")
+    print(f"   {len(rag.index.entries)} chunks indexed")
+    print(f"   Embedding dimension: {rag.index.embedding_model.dimension}")
+    print(f"   Hybrid search: Dense + BM25")
     print("-" * 60)
     print("Type your question and press Enter.")
-    print(f"Commands: {', '.join(sorted(EXIT_COMMANDS))}")
+    print("Type /help for commands, or quit to exit.")
     print("=" * 60 + "\n")
 
     while True:
@@ -217,19 +322,29 @@ def interactive_loop(
             print("👋 Goodbye!")
             break
 
-        answer = answer_query(
-            index,
-            retriever,
-            user_input,
-            use_llm,
-            show_steps,
-        )
-        print(f"\n🤖 Assistant: {answer}\n")
+        # Handle special commands
+        if user_input.startswith("/"):
+            response = rag.handle_command(user_input)
+            if response:
+                print(f"\n{response}\n")
+            continue
+
+        # Get answer
+        print("\n🤖 Assistant: ", end="" if stream else "")
+        
+        if stream:
+            rag.answer(user_input, stream=True)
+        else:
+            answer = rag.answer(user_input)
+            formatted = rag.format_response(answer)
+            print(formatted)
+        
+        print()
 
 
 def main() -> None:
     parser = ArgumentParser(
-        description="Interactive RAG system for querying documents with dense embeddings."
+        description="Advanced RAG system with hybrid search and conversation memory."
     )
     parser.add_argument(
         "-d", "--docs-dir",
@@ -249,6 +364,16 @@ def main() -> None:
     parser.add_argument(
         "--show-steps",
         help="Show detailed processing logs",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--stream",
+        help="Stream responses in real-time",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-enhancement",
+        help="Disable query enhancement",
         action="store_true",
     )
     args = parser.parse_args()
@@ -277,11 +402,16 @@ def main() -> None:
         LOGGER.error("No chunks were indexed. Check your documents.")
         sys.exit(1)
 
-    # Create retriever
-    retriever = Retriever(index)
+    # Create RAG system
+    rag = RAGSystem(
+        index=index,
+        use_llm=args.use_llm,
+        use_query_enhancement=not args.no_enhancement,
+        show_steps=args.show_steps,
+    )
 
     # Start interactive session
-    interactive_loop(index, retriever, args.use_llm, args.show_steps)
+    interactive_loop(rag, stream=args.stream)
 
 
 if __name__ == "__main__":

@@ -13,8 +13,3 @@ pymupdf>=1.23.0
 # OpenAI LLM
 openai>=1.0.0
 python-dotenv>=1.0.0
-
-# Optional: better sentence splitting
-nltk>=3.8.0
-
-

@@ -192,6 +192,9 @@ Maintains context across turns:
 - No secrets in commit history
 - Rotate keys if exposed
 
+DIMPHO KGAUME PITSI🫆
+
+
 ## 📝 License
 
 MIT
